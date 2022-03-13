@@ -619,4 +619,87 @@ class UrmpMidiUnsegmented(Urmp):
     ds = ds.map(_reshape_tensors, num_parallel_calls=_AUTOTUNE)
     return ds
 
+class PhonemeRecordProvider(DataProvider):
+  """Class for reading records and returning a dataset."""
+
+  def __init__(self,
+               file_pattern,
+               example_secs,
+               sample_rate,
+               frame_rate,
+               data_format_map_fn,
+               centered=False):
+    """RecordProvider constructor."""
+    self._file_pattern = file_pattern or self.default_file_pattern
+    self._audio_length = example_secs * sample_rate
+    super().__init__(sample_rate, frame_rate)
+    self._feature_length = self.get_feature_length(centered)
+    self._data_format_map_fn = data_format_map_fn
+
+  def get_feature_length(self, centered):
+    """Take into account center padding to get number of frames."""
+    # Number of frames is independent of frame size for "center/same" padding.
+    frame_size = 1024
+    hop_size = self.sample_rate / self.frame_rate
+    padding = 'center' if centered else 'same'
+    return get_framed_lengths(
+        self._audio_length, frame_size, hop_size, padding)[0]
+
+  @property
+  def default_file_pattern(self):
+    """Used if file_pattern is not provided to constructor."""
+    raise NotImplementedError(
+        'You must pass a "file_pattern" argument to the constructor or '
+        'choose a FileDataProvider with a default_file_pattern.')
+
+  def get_dataset(self, shuffle=True):
+    """Read dataset.
+
+    Args:
+      shuffle: Whether to shuffle the files.
+
+    Returns:
+      dataset: A tf.dataset that reads from the TFRecord.
+    """
+    def parse_tfexample(record):
+      return tf.io.parse_single_example(record, self.features_dict)
+
+    filenames = tf.data.Dataset.list_files(self._file_pattern, shuffle=shuffle)
+    dataset = filenames.interleave(
+        map_func=self._data_format_map_fn,
+        cycle_length=40,
+        num_parallel_calls=_AUTOTUNE)
+    dataset = dataset.map(parse_tfexample, num_parallel_calls=_AUTOTUNE)
+    return dataset
+
+  @property
+  def features_dict(self):
+    """Dictionary of features to read from dataset."""
+    return {
+        'audio':
+            tf.io.FixedLenFeature([self._audio_length], dtype=tf.float32),
+        'f0_hz':
+            tf.io.FixedLenFeature([self._feature_length], dtype=tf.float32),
+        'f0_confidence':
+            tf.io.FixedLenFeature([self._feature_length], dtype=tf.float32),
+        'phoneme':
+            tf.io.FixedLenFeature([self._feature_length], dtype=tf.int64),
+        'loudness_db':
+            tf.io.FixedLenFeature([self._feature_length], dtype=tf.float32),
+    }
+
+
+@gin.register
+class TFRecordProviderPhoneme(PhonemeRecordProvider):
+  """Class for reading TFRecords and returning a dataset."""
+
+  def __init__(self,
+               file_pattern=None,
+               example_secs=10,
+               sample_rate=16000,
+               frame_rate=250):
+    """TFRecordProvider constructor."""
+    super().__init__(file_pattern, example_secs, sample_rate,
+                     frame_rate, tf.data.TFRecordDataset)
+
 

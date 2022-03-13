@@ -27,7 +27,7 @@ ddsp_prepare_tfrecord \
 
 from absl import app
 from absl import flags
-from ddsp.training.data_preparation.prepare_tfrecord_lib import prepare_tfrecord
+from ddsp.training.data_preparation.prepare_tfrecord_lib import prepare_tfrecord, prepare_tfrecord_labeled_phonemes
 import tensorflow.compat.v2 as tf
 
 FLAGS = flags.FLAGS
@@ -87,7 +87,7 @@ def run():
   for filepattern in FLAGS.input_audio_filepatterns:
     input_audio_paths.extend(tf.io.gfile.glob(filepattern))
 
-  prepare_tfrecord(
+  prepare_tfrecord_labeled_phonemes(
       input_audio_paths,
       FLAGS.output_tfrecord_path,
       num_shards=FLAGS.num_shards,

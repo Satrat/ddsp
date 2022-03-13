@@ -73,7 +73,7 @@ class F0LoudnessPreprocessor(nn.DictLayer):
     self.compute_loudness = compute_loudness
 
   def call(self, loudness_db, f0_hz, audio=None) -> [
-      'f0_hz', 'loudness_db', 'f0_scaled', 'ld_scaled']:
+      'f0_hz', 'loudness_db', 'phoneme', 'f0_scaled', 'ld_scaled']:
     # Compute loudness fresh (it's fast).
     if self.compute_loudness:
       loudness_db = ddsp.spectral_ops.compute_loudness(
@@ -84,11 +84,12 @@ class F0LoudnessPreprocessor(nn.DictLayer):
     # Resample features to the frame_rate.
     f0_hz = self.resample(f0_hz)
     loudness_db = self.resample(loudness_db)
+    phoneme = self.resample(phoneme)
     # For NN training, scale frequency and loudness to the range [0, 1].
     # Log-scale f0 features. Loudness from [-1, 0] to [1, 0].
     f0_scaled = scale_f0_hz(f0_hz)
     ld_scaled = scale_db(loudness_db)
-    return f0_hz, loudness_db, f0_scaled, ld_scaled
+    return f0_hz, loudness_db, phoneme, f0_scaled, ld_scaled
 
   @staticmethod
   def invert_scaling(f0_scaled, ld_scaled):

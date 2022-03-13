@@ -17,7 +17,7 @@
 
 from absl import logging
 import apache_beam as beam
-from ddsp import spectral_ops
+from ddsp import spectral_ops, phonemes
 import numpy as np
 import pydub
 import tensorflow.compat.v2 as tf
@@ -60,6 +60,16 @@ def _load_audio(audio_path, sample_rate):
   audio = _load_audio_as_array(audio_path, sample_rate)
   return {'audio': audio}
 
+def _load_audio_and_annotations(audio_path, sample_rate, frame_rate):
+  """Load audio file and associated ground truth annotations"""
+  logging.info("Loading '%s'.", audio_path)
+  # TODO: make this not hardcoded to CSD dataset
+  midi_path = audio_path.replace('wav', 'mid')
+  phoneme_path = audio_path.replace('wav', 'txt')
+  beam.metrics.Metrics.counter('prepare-tfrecord', 'load-audio').inc()
+  audio = _load_audio_as_array(audio_path, sample_rate)
+  f0_annotation, phoneme_annotation = phonemes.annotate_f0_and_phoneme(audio, sample_rate, midi_path, phoneme_path, frame_rate)
+  return {'audio': audio, 'f0_hz' : f0_annotation, 'phoneme' : phoneme_annotation}
 
 def _chunk_audio(ex, sample_rate, chunk_secs):
   """Pad audio and split into chunks."""
@@ -70,6 +80,21 @@ def _chunk_audio(ex, sample_rate, chunk_secs):
   n_chunks = chunks.shape[0]
   for i in range(n_chunks):
     yield {'audio': chunks[i]}
+
+def _chunk_audio_and_annotations(ex, sample_rate, frame_rate, chunk_secs):
+  """Pad audio and split into chunks."""
+  beam.metrics.Metrics.counter('prepare-tfrecord', 'load-audio').inc()
+  audio = ex['audio']
+  f0_hz = ex['f0_hz']
+  phoneme = ex['phoneme']
+  chunk_size = int(chunk_secs * sample_rate)
+  chunk_size_frames = int(chunk_secs * frame_rate)
+  chunks = tf.signal.frame(audio, chunk_size, chunk_size, pad_end=True)
+  chunks_f0 = tf.signal.frame(f0_hz, chunk_size_frames, chunk_size_frames, pad_end=True)
+  chunks_phoneme = tf.signal.frame(phoneme, chunk_size_frames, chunk_size_frames, pad_end=True)
+  n_chunks = chunks.shape[0]
+  for i in range(n_chunks):
+    yield {'audio': chunks[i], 'f0_hz' : chunks_f0[i], 'phoneme' : chunks_phoneme[i]}
 
 
 def _add_f0_estimate(ex, frame_rate, center, viterbi):
@@ -85,7 +110,17 @@ def _add_f0_estimate(ex, frame_rate, center, viterbi):
       'f0_confidence': f0_confidence.astype(np.float32)
   })
   return ex
-
+  
+def _add_full_f0_confidence(ex, sample_rate, frame_rate):
+  beam.metrics.Metrics.counter('prepare-tfrecord', 'estimate-f0').inc()
+  audio = ex['audio']
+  audio_len_sec = audio.shape[-1] / float(sample_rate)
+  num_frames = int(audio_len_sec * frame_rate)
+  ex = dict(ex)
+  ex.update({
+      'f0_confidence': np.ones(num_frames, dtype=np.float32)
+  })
+  return ex
 
 def _add_loudness(ex, sample_rate, frame_rate, n_fft, center):
   """Add loudness in dB."""
@@ -114,17 +149,19 @@ def _split_example(ex, sample_rate, frame_rate, example_secs, hop_secs, center):
       end = start + window_size
       yield sequence[start:end]
 
-  for audio, loudness_db, f0_hz, f0_confidence in zip(
+  for audio, loudness_db, f0_hz, f0_confidence, phoneme in zip(
       get_windows(ex['audio'], sample_rate, center=False),
       get_windows(ex['loudness_db'], frame_rate, center),
       get_windows(ex['f0_hz'], frame_rate, center),
-      get_windows(ex['f0_confidence'], frame_rate, center)):
+      get_windows(ex['f0_confidence'], frame_rate, center),
+      get_windows(ex['phoneme'], frame_rate, center),):
     beam.metrics.Metrics.counter('prepare-tfrecord', 'split-example').inc()
     yield {
         'audio': audio,
         'loudness_db': loudness_db,
         'f0_hz': f0_hz,
-        'f0_confidence': f0_confidence
+        'f0_confidence': f0_confidence,
+        'phoneme': phoneme
     }
 
 
@@ -221,7 +258,7 @@ def prepare_tfrecord(input_audio_paths,
     examples = (
         pipeline
         | beam.Create(input_audio_paths)
-        | beam.Map(_load_audio, sample_rate))
+        | beam.Map(_load_audio, sample_rate, ))
 
     # Split into chunks for train/eval split and better parallelism.
     if chunk_secs:
@@ -238,6 +275,114 @@ def prepare_tfrecord(input_audio_paths,
                      frame_rate=frame_rate,
                      center=center,
                      viterbi=viterbi)
+          | beam.Map(_add_loudness,
+                     sample_rate=sample_rate,
+                     frame_rate=frame_rate,
+                     n_fft=512,
+                     center=center))
+
+    # Create train/eval split.
+    if eval_split_fraction:
+      examples |= beam.Map(_add_key)
+      keys = examples | beam.Keys()
+      splits = examples | beam.Partition(_eval_split_partition_fn, 2,
+                                         eval_split_fraction,
+                                         beam.pvalue.AsList(keys))
+
+      # Remove ids.
+      eval_split = splits[0] | 'remove_id_eval' >> beam.Map(lambda x: x[1])
+      train_split = splits[1] | 'remove_id_train' >> beam.Map(lambda x: x[1])
+
+      postprocess_pipeline(eval_split, f'{output_tfrecord_path}-eval', 'eval')
+      postprocess_pipeline(train_split, f'{output_tfrecord_path}-train',
+                           'train')
+    else:
+      postprocess_pipeline(examples, output_tfrecord_path)
+
+def prepare_tfrecord_labeled_phonemes(input_audio_paths,
+                     output_tfrecord_path,
+                     num_shards=None,
+                     sample_rate=16000,
+                     frame_rate=250,
+                     example_secs=4,
+                     hop_secs=1,
+                     eval_split_fraction=0.0,
+                     chunk_secs=20.0,
+                     center=False,
+                     viterbi=True,
+                     pipeline_options=''):
+  """Prepares a TFRecord for use in training, evaluation, and prediction.
+
+  Args:
+    input_audio_paths: An iterable of paths to audio files to include in
+      TFRecord.
+    output_tfrecord_path: The prefix path to the output TFRecord. Shard numbers
+      will be added to actual path(s).
+    num_shards: The number of shards to use for the TFRecord. If None, this
+      number will be determined automatically.
+    sample_rate: The sample rate to use for the audio.
+    frame_rate: The frame rate to use for f0 and loudness features. If set to
+      None, these features will not be computed.
+    example_secs: The size of the sliding window (in seconds) to use to split
+      the audio and features. If 0, they will not be split.
+    hop_secs: The number of seconds to hop when computing the sliding windows.
+    eval_split_fraction: Fraction of the dataset to reserve for eval split. If
+      set to 0, no eval split is created.
+    chunk_secs: Chunk size in seconds used to split the input audio
+      files. This is used to split large audio files into manageable chunks for
+      better parallelization and to enable non-overlapping train/eval splits.
+    center: Provide zero-padding to audio so that frame timestamps will be
+      centered.
+    viterbi: Use viterbi decoding of pitch.
+    pipeline_options: An iterable of command line arguments to be used as
+      options for the Beam Pipeline.
+  """
+  def postprocess_pipeline(examples, output_path, stage_name=''):
+    """After chunking, features, and train-eval split, create TFExamples."""
+    if stage_name:
+      stage_name = f'_{stage_name}'
+
+    if example_secs:
+      examples |= f'split_examples{stage_name}' >> beam.FlatMap(
+          _split_example,
+          sample_rate=sample_rate,
+          frame_rate=frame_rate,
+          example_secs=example_secs,
+          hop_secs=hop_secs,
+          center=center)
+    _ = (
+        examples
+        | f'reshuffle{stage_name}' >> beam.Reshuffle()
+        | f'make_tfexample{stage_name}' >> beam.Map(_float_dict_to_tfexample)
+        | f'write{stage_name}' >> beam.io.tfrecordio.WriteToTFRecord(
+            output_path,
+            num_shards=num_shards,
+            coder=beam.coders.ProtoCoder(tf.train.Example)))
+
+  # Start the pipeline.
+  pipeline_options = beam.options.pipeline_options.PipelineOptions(
+      pipeline_options)
+  with beam.Pipeline(options=pipeline_options) as pipeline:
+    examples = (
+        pipeline
+        | beam.Create(input_audio_paths)
+        | beam.Map(_load_audio_and_annotations, sample_rate, frame_rate))
+
+    # Split into chunks for train/eval split and better parallelism.
+    if chunk_secs:
+      examples |= beam.FlatMap(
+          _chunk_audio_and_annotations,
+          sample_rate=sample_rate,
+          frame_rate=frame_rate,
+          chunk_secs=chunk_secs)
+
+    # Add loudness features not present in annotations
+    if frame_rate:
+      examples = (
+          examples
+          | beam.Map(_add_full_f0_confidence,
+                     sample_rate=sample_rate,
+                     frame_rate=frame_rate)
           | beam.Map(_add_loudness,
                      sample_rate=sample_rate,
                      frame_rate=frame_rate,
